@@ -101,8 +101,12 @@ func CheckProperHTTPMethodsAndStatusCodes(r *Rubric) error {
 			http.MethodPut,
 			http.MethodDelete,
 			http.MethodPatch,
-			http.MethodHead,
+			//http.MethodHead, -> same as GET without body... foreshadowing Project 2
 		},
+	}
+	client := http.Client{
+		Transport: http.DefaultTransport,
+		Timeout:   2 * time.Second, // extra generous timeout for slower languages.
 	}
 	for endpoint, methods := range badMethods {
 		for _, method := range methods {
@@ -110,7 +114,7 @@ func CheckProperHTTPMethodsAndStatusCodes(r *Rubric) error {
 			if err != nil {
 				continue
 			}
-			resp, err := http.DefaultClient.Do(req)
+			resp, err := client.Do(req)
 			if err != nil {
 				continue
 			}
@@ -122,6 +126,7 @@ func CheckProperHTTPMethodsAndStatusCodes(r *Rubric) error {
 		}
 	}
 	if r.AwardedPoints > 0 {
+		r.AwardedPoints++ // free point to make the math even.
 		fmt.Printf("Proper HTTP Methods and Status Codes: +%d\n", r.AwardedPoints)
 	}
 
@@ -232,8 +237,11 @@ func authentication(expired bool) (*jwt.Token, error) {
 		q.Add("expired", "true")
 		req.URL.RawQuery = q.Encode()
 	}
-
-	resp, err := http.DefaultClient.Do(req)
+	client := http.Client{
+		Transport: http.DefaultTransport,
+		Timeout:   2 * time.Second, // extra generous timeout for slower languages.
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -241,7 +249,9 @@ func authentication(expired bool) (*jwt.Token, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error authenticating: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
