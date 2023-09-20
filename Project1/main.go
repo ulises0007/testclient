@@ -166,7 +166,7 @@ func CheckProperHTTPMethodsAndStatusCodes(_ *Context) (Result, error) {
 				continue
 			}
 			if resp.StatusCode != http.StatusMethodNotAllowed {
-				logger.Debug(fmt.Sprintf("expected status code: %d, got %d", http.StatusMethodNotAllowed, resp.StatusCode), slog.String("err", err.Error()))
+				logger.Debug(fmt.Sprintf("expected status code: %d, got %d", http.StatusMethodNotAllowed, resp.StatusCode))
 				continue
 			}
 			logger.Debug("Proper HTTP Method and Status Code: +1")
