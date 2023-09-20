@@ -1,17 +1,18 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
-	"reflect"
-	"runtime"
-	"strings"
 	"time"
 
 	"github.com/MicahParks/keyfunc/v2"
+	"github.com/alecthomas/kong"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/jedib0t/go-pretty/v6/table"
 )
 
 const (
@@ -20,74 +21,114 @@ const (
 	JWKSEndpoint = "/.well-known/jwks.json"
 )
 
-type Rubric struct {
-	Authentication                  int
-	ProperHTTPMethodsAndStatusCodes int
-	ValidJWKFoundInJWKS             int
-	ExpiredJWTIsExpired             int
-	ExpiredJWKNotFoundInJWKS        int
-
-	AwardedPoints int
-
-	validJWT      *jwt.Token
-	expiredJWT    *jwt.Token
-	expiredJWTErr error
-}
-
-func (r Rubric) AvailablePoints() int {
-	return r.Authentication +
-		r.ProperHTTPMethodsAndStatusCodes +
-		r.ValidJWKFoundInJWKS +
-		r.ExpiredJWTIsExpired +
-		r.ExpiredJWKNotFoundInJWKS
+type grammar struct {
+	Debug bool `help:"Debug output."`
+	Total bool `help:"Print total only"`
 }
 
 func main() {
-	rubric := Rubric{
-		Authentication:                  20,
-		ProperHTTPMethodsAndStatusCodes: 10,
-		ValidJWKFoundInJWKS:             20,
-		ExpiredJWTIsExpired:             5,
-		ExpiredJWKNotFoundInJWKS:        10,
+	var cli grammar
+	if err := kong.Parse(&cli).Run(); err != nil {
+		fmt.Printf("error running gradebot: %v", err)
 	}
-	var err error
-	defer func() {
-		fmt.Printf("Awarded %d/%d points.\n", rubric.AwardedPoints, rubric.AvailablePoints())
-	}()
-	for _, check := range []func(*Rubric) error{
+}
+
+type (
+	Context struct {
+		validJWT   *jwt.Token
+		expiredJWT *jwt.Token
+	}
+	Check  func(*Context) (Result, error)
+	Result struct {
+		label    string
+		awarded  int
+		possible int
+		message  string
+	}
+)
+
+func (g grammar) Run() error {
+	var (
+		rubric  Context
+		results = make([]Result, 0)
+	)
+	for _, check := range []Check{
 		CheckAuthentication,
 		CheckProperHTTPMethodsAndStatusCodes,
 		CheckValidJWKFoundInJWKS,
 		CheckExpiredJWTIsExpired,
 		CheckExpiredJWKNotFoundInJWKS,
 	} {
-		if err = check(&rubric); err != nil {
-			pathing := strings.Split(runtime.FuncForPC(reflect.ValueOf(check).Pointer()).Name(), ".")
-			test := strings.TrimLeft(pathing[len(pathing)-1], "Check")
-			fmt.Printf("error running test '%v': %v\n", test, err)
+		result, err := check(&rubric)
+		if err != nil {
+			slog.Error(result.label, slog.String("err", err.Error()))
 		}
+		results = append(results, result)
 	}
-}
 
-func CheckAuthentication(r *Rubric) error {
-	var err error
-	if r.validJWT, err = authentication(false); err != nil && !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
-		return err
+	if g.Total {
+		totalPoints := 0
+		for i := range results {
+			totalPoints += results[i].awarded
+		}
+		fmt.Println(totalPoints)
+		return nil
 	}
-	r.AwardedPoints += 15
-	fmt.Println("Valid JWT: +15")
 
-	r.expiredJWT, r.expiredJWTErr = authentication(true)
-	if r.expiredJWTErr == nil || r.expiredJWT.Valid {
-		return fmt.Errorf("expected expired JWT, got nil")
+	t := table.NewWriter()
+	t.AppendHeader(table.Row{"Rubric Item", "Error?", "Points Awarded"})
+	t.SetStyle(table.StyleRounded)
+
+	var (
+		possiblePoints int
+		totalPoints    int
+	)
+	for i := range results {
+		t.AppendRow([]any{results[i].label, results[i].message, results[i].awarded})
+		possiblePoints += results[i].possible
+		totalPoints += results[i].awarded
 	}
-	r.AwardedPoints += 5
-	fmt.Println("Expired JWT: +5")
+	t.AppendFooter(table.Row{"", "Possible", possiblePoints})
+	t.AppendFooter(table.Row{"", "Awarded", totalPoints})
+	fmt.Println(t.Render())
 
 	return nil
 }
 
-func CheckProperHTTPMethodsAndStatusCodes(r *Rubric) error {
+func CheckAuthentication(r *Context) (Result, error) {
+	result := Result{
+		label:    "/auth JWT authN",
+		awarded:  0,
+		possible: 20,
+	}
+	var err error
+	if r.validJWT, err = authentication(false); err != nil && !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+		result.message = err.Error()
+		return result, err
+	}
+	result.awarded += 15
+	slog.Debug("Valid JWT: +15")
+
+	r.expiredJWT, err = authentication(true)
+	if err == nil {
+		result.message = "expected expired JWT to error"
+		return result, fmt.Errorf("expected expired JWT to error")
+	} else if r.expiredJWT.Valid {
+		result.message = "expected expired JWT to be invalid"
+		return result, fmt.Errorf("expected expired JWT to be invalid")
+	}
+	result.awarded += 5
+	slog.Debug("Expired JWT: +5")
+
+	return result, nil
+}
+
+func CheckProperHTTPMethodsAndStatusCodes(_ *Context) (Result, error) {
+	result := Result{
+		label:    "Proper HTTP methods/Status codes",
+		awarded:  1, // free point to make the math even.
+		possible: 10,
+	}
 	badMethods := map[string][]string{
 		AuthEndpoint: {
 			http.MethodGet,
@@ -110,99 +151,131 @@ func CheckProperHTTPMethodsAndStatusCodes(r *Rubric) error {
 	}
 	for endpoint, methods := range badMethods {
 		for _, method := range methods {
+			logger := slog.With(
+				slog.String("endpoint", endpoint),
+				slog.String("method", method),
+			)
 			req, err := http.NewRequest(method, hostURL+endpoint, http.NoBody)
 			if err != nil {
+				logger.Error("could not create request", slog.String("err", err.Error()))
 				continue
 			}
 			resp, err := client.Do(req)
 			if err != nil {
+				logger.Error("error in response", slog.String("err", err.Error()))
 				continue
 			}
 			if resp.StatusCode != http.StatusMethodNotAllowed {
-				fmt.Printf("%v: expected status code %d for %v, got %d\n", endpoint, http.StatusMethodNotAllowed, method, resp.StatusCode)
+				logger.Debug(fmt.Sprintf("expected status code: %d, got %d", http.StatusMethodNotAllowed, resp.StatusCode), slog.String("err", err.Error()))
 				continue
 			}
-			r.AwardedPoints++
+			logger.Debug("Proper HTTP Method and Status Code: +1")
+			result.awarded++
 		}
 	}
-	if r.AwardedPoints > 0 {
-		r.AwardedPoints++ // free point to make the math even.
-		fmt.Printf("Proper HTTP Methods and Status Codes: +%d\n", r.AwardedPoints)
+	if result.awarded > 0 {
+		slog.Debug("Proper HTTP Methods and Status Codes: +%d", result.awarded)
 	}
 
-	return nil
+	return result, nil
 }
 
-func CheckValidJWKFoundInJWKS(r *Rubric) error {
+func CheckValidJWKFoundInJWKS(r *Context) (Result, error) {
+	result := Result{
+		label:    "Valid JWK found in JWKS",
+		awarded:  0,
+		possible: 20,
+	}
 	if r.validJWT == nil {
-		return fmt.Errorf("no valid JWT found")
+		result.message = "no valid JWT found"
+		return result, fmt.Errorf("no valid JWT found")
 	}
 
 	jwks, err := keyfunc.Get(hostURL+JWKSEndpoint, keyfunc.Options{})
 	if err != nil {
-		return fmt.Errorf("JWKS: %w", err)
+		result.message = err.Error()
+		return result, fmt.Errorf("JWKS: %w", err)
 	}
 
 	token, err := jwt.ParseWithClaims(r.validJWT.Raw, &jwt.RegisteredClaims{}, jwks.Keyfunc)
 	if err != nil {
-		return fmt.Errorf("failed to validate token: %w", err)
+		result.message = err.Error()
+		return result, fmt.Errorf("failed to validate token: %w", err)
 	}
 
-	r.AwardedPoints += 20
-	fmt.Println("Valid JWK found in JWKS: +20")
-	printJWT("Valid", token)
+	result.awarded += 20
+	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		printJWT("Valid", token)
+	}
+	slog.Debug("Valid JWK found in JWKS: +20")
 
-	return nil
+	return result, nil
 }
 
-func CheckExpiredJWTIsExpired(r *Rubric) error {
+func CheckExpiredJWTIsExpired(r *Context) (Result, error) {
+	result := Result{
+		label:    "Expired JWT is expired",
+		awarded:  0,
+		possible: 5,
+	}
 	if r.expiredJWT == nil {
-		return fmt.Errorf("no expired JWT found")
+		result.message = "no expired JWT found"
+		return result, fmt.Errorf("no expired JWT found")
 	}
 	expiry, err := r.expiredJWT.Claims.GetExpirationTime()
 	if err != nil {
-		return fmt.Errorf("expected expired token to have an expiry")
+		result.message = err.Error()
+		return result, fmt.Errorf("expected expired token to have an expiry")
 	}
 	if expiry.After(time.Now()) {
-		return fmt.Errorf("expected expired token to have an expiry in the past")
+		result.message = err.Error()
+		return result, fmt.Errorf("expected expired token to have an expiry in the past")
 	}
-	r.AwardedPoints += 5
-	fmt.Println("Expired JWT actually expired: +5")
+	result.awarded += 5
+	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		printJWT("Expired", r.expiredJWT)
+	}
+	slog.Debug("Expired JWT actually expired: +5")
 
-	return nil
+	return result, nil
 }
 
-func CheckExpiredJWKNotFoundInJWKS(r *Rubric) error {
+func CheckExpiredJWKNotFoundInJWKS(r *Context) (Result, error) {
+	result := Result{
+		label:    "Expired JWK does not exist in JWKS",
+		awarded:  0,
+		possible: 10,
+	}
 	if r.expiredJWT == nil {
-		return fmt.Errorf("no expired JWT found")
+		result.message = "no expired JWT found"
+		return result, fmt.Errorf("no expired JWT found")
 	}
 
 	jwks, err := keyfunc.Get(hostURL+JWKSEndpoint, keyfunc.Options{})
 	if err != nil {
-		return fmt.Errorf("JWKS error: %w", err)
+		result.message = err.Error()
+		return result, fmt.Errorf("JWKS error: %w", err)
 	}
 
-	token, err := jwt.ParseWithClaims(r.expiredJWT.Raw, &jwt.RegisteredClaims{}, jwks.Keyfunc)
-
+	_, err = jwt.ParseWithClaims(r.expiredJWT.Raw, &jwt.RegisteredClaims{}, jwks.Keyfunc)
 	switch {
 	case errors.Is(err, keyfunc.ErrKIDNotFound):
-		// no-op because this is expected
+		result.awarded += 10
+		slog.Debug("Expired JWK KID does not exist in JWKS: +10")
 	case err != nil:
-		return fmt.Errorf("unexpected error: %w", err)
+		result.message = err.Error()
+		return result, fmt.Errorf("unexpected error: %w", err)
 	default:
-		return fmt.Errorf("expected KID to not be found: %w", err)
+		result.message = "expected KID to not be found"
+		return result, fmt.Errorf("expected KID to not be found")
 	}
 
-	r.AwardedPoints += 10
-	printJWT("Expired", token)
-	fmt.Println("Expired JWT KID Not Found in JWKS: +15")
-
-	return nil
+	return result, nil
 }
 
 func printJWT(name string, token *jwt.Token) {
 	fmt.Printf("\t%v JWT valid: %v\n", name, token.Valid)
-	fmt.Printf("\t%v JWT header: %v\n", name, token.Header)
+	fmt.Printf("\t%v JWT Header: %#v\n", name, token.Header)
 	claims := token.Claims.(*jwt.RegisteredClaims)
 	if claims.Issuer != "" {
 		fmt.Printf("\t%v JWT Issuer: %v\n", name, claims.Issuer)
@@ -256,6 +329,7 @@ func authentication(expired bool) (*jwt.Token, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return jwt.ParseWithClaims(string(body), &jwt.RegisteredClaims{}, func(token *jwt.Token) (interface{}, error) {
 		return token, nil
 	})
