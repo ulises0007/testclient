@@ -8,7 +8,7 @@ before:
     - go generate ./...
 builds:
   - dir: Project1
-    binary: proj1_checker
+    binary: gradebot
     env:
       - CGO_ENABLED=0
     tags:

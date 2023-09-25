@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/MicahParks/keyfunc/v2"
@@ -16,12 +17,12 @@ import (
 )
 
 const (
-	hostURL      = "http://127.0.0.1:8080"
 	AuthEndpoint = "/auth"
 	JWKSEndpoint = "/.well-known/jwks.json"
 )
 
 type grammar struct {
+	Port  int  `env:"PORT" short:"p" help:"Port to check." default:"8080"`
 	Debug bool `help:"Debug output."`
 	Total bool `help:"Print total only"`
 }
@@ -29,12 +30,13 @@ type grammar struct {
 func main() {
 	var cli grammar
 	if err := kong.Parse(&cli).Run(); err != nil {
-		fmt.Printf("error running gradebot: %v", err)
+		slog.Error("error running gradebot", slog.String("err", err.Error()))
 	}
 }
 
 type (
 	Context struct {
+		hostURL    string
 		validJWT   *jwt.Token
 		expiredJWT *jwt.Token
 	}
@@ -48,10 +50,24 @@ type (
 )
 
 func (g grammar) Run() error {
+	// Set up logging.
+	lvl := new(slog.LevelVar)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: lvl,
+	}))
+	if g.Debug {
+		lvl.Set(slog.LevelDebug)
+	}
+	if g.Total {
+		lvl.Set(10)
+	}
+	slog.SetDefault(logger)
+
 	var (
 		rubric  Context
 		results = make([]Result, 0)
 	)
+	rubric.hostURL = fmt.Sprintf("http://127.0.0.1:%d", g.Port)
 	for _, check := range []Check{
 		CheckAuthentication,
 		CheckProperHTTPMethodsAndStatusCodes,
@@ -102,15 +118,18 @@ func CheckAuthentication(r *Context) (Result, error) {
 		possible: 20,
 	}
 	var err error
-	if r.validJWT, err = authentication(false); err != nil && !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+	if r.validJWT, err = authentication(r.hostURL, false); err != nil && !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
 		result.message = err.Error()
 		return result, err
 	}
 	result.awarded += 15
-	slog.Debug("Valid JWT: +15")
+	slog.Debug("Valid JWT", slog.Int("pts", 15))
 
-	r.expiredJWT, err = authentication(true)
-	if err == nil {
+	r.expiredJWT, err = authentication(r.hostURL, true)
+	if r.expiredJWT == nil {
+		result.message = "expected expired JWT to exist"
+		return result, fmt.Errorf("expected expired JWT to exist")
+	} else if err == nil {
 		result.message = "expected expired JWT to error"
 		return result, fmt.Errorf("expected expired JWT to error")
 	} else if r.expiredJWT.Valid {
@@ -118,12 +137,12 @@ func CheckAuthentication(r *Context) (Result, error) {
 		return result, fmt.Errorf("expected expired JWT to be invalid")
 	}
 	result.awarded += 5
-	slog.Debug("Expired JWT: +5")
+	slog.Debug("Expired JWT", slog.Int("pts", 5))
 
 	return result, nil
 }
 
-func CheckProperHTTPMethodsAndStatusCodes(_ *Context) (Result, error) {
+func CheckProperHTTPMethodsAndStatusCodes(ctx *Context) (Result, error) {
 	result := Result{
 		label:    "Proper HTTP methods/Status codes",
 		awarded:  1, // free point to make the math even.
@@ -155,7 +174,7 @@ func CheckProperHTTPMethodsAndStatusCodes(_ *Context) (Result, error) {
 				slog.String("endpoint", endpoint),
 				slog.String("method", method),
 			)
-			req, err := http.NewRequest(method, hostURL+endpoint, http.NoBody)
+			req, err := http.NewRequest(method, ctx.hostURL+endpoint, http.NoBody)
 			if err != nil {
 				logger.Error("could not create request", slog.String("err", err.Error()))
 				continue
@@ -169,12 +188,12 @@ func CheckProperHTTPMethodsAndStatusCodes(_ *Context) (Result, error) {
 				logger.Debug(fmt.Sprintf("expected status code: %d, got %d", http.StatusMethodNotAllowed, resp.StatusCode))
 				continue
 			}
-			logger.Debug("Proper HTTP Method and Status Code: +1")
+			logger.Debug("Proper HTTP Method and Status Code", slog.Int("pts", 1))
 			result.awarded++
 		}
 	}
 	if result.awarded > 0 {
-		slog.Debug("Proper HTTP Methods and Status Codes: +%d", result.awarded)
+		slog.Debug("All Proper HTTP Methods and Status Codes", slog.Int("pts", result.awarded))
 	}
 
 	return result, nil
@@ -191,7 +210,7 @@ func CheckValidJWKFoundInJWKS(r *Context) (Result, error) {
 		return result, fmt.Errorf("no valid JWT found")
 	}
 
-	jwks, err := keyfunc.Get(hostURL+JWKSEndpoint, keyfunc.Options{})
+	jwks, err := keyfunc.Get(r.hostURL+JWKSEndpoint, keyfunc.Options{})
 	if err != nil {
 		result.message = err.Error()
 		return result, fmt.Errorf("JWKS: %w", err)
@@ -207,7 +226,7 @@ func CheckValidJWKFoundInJWKS(r *Context) (Result, error) {
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
 		printJWT("Valid", token)
 	}
-	slog.Debug("Valid JWK found in JWKS: +20")
+	slog.Debug("Valid JWK found in JWKS", slog.Int("pts", 20))
 
 	return result, nil
 }
@@ -235,7 +254,7 @@ func CheckExpiredJWTIsExpired(r *Context) (Result, error) {
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
 		printJWT("Expired", r.expiredJWT)
 	}
-	slog.Debug("Expired JWT actually expired: +5")
+	slog.Debug("Expired JWT actually expired", slog.Int("pts", 5))
 
 	return result, nil
 }
@@ -251,7 +270,7 @@ func CheckExpiredJWKNotFoundInJWKS(r *Context) (Result, error) {
 		return result, fmt.Errorf("no expired JWT found")
 	}
 
-	jwks, err := keyfunc.Get(hostURL+JWKSEndpoint, keyfunc.Options{})
+	jwks, err := keyfunc.Get(r.hostURL+JWKSEndpoint, keyfunc.Options{})
 	if err != nil {
 		result.message = err.Error()
 		return result, fmt.Errorf("JWKS error: %w", err)
@@ -261,7 +280,7 @@ func CheckExpiredJWKNotFoundInJWKS(r *Context) (Result, error) {
 	switch {
 	case errors.Is(err, keyfunc.ErrKIDNotFound):
 		result.awarded += 10
-		slog.Debug("Expired JWK KID does not exist in JWKS: +10")
+		slog.Debug("Expired JWK KID does not exist in JWKS", slog.Int("pts", 10))
 	case err != nil:
 		result.message = err.Error()
 		return result, fmt.Errorf("unexpected error: %w", err)
@@ -300,7 +319,7 @@ func printJWT(name string, token *jwt.Token) {
 	}
 }
 
-func authentication(expired bool) (*jwt.Token, error) {
+func authentication(hostURL string, expired bool) (*jwt.Token, error) {
 	req, err := http.NewRequest(http.MethodPost, hostURL+AuthEndpoint, http.NoBody)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
