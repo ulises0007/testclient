@@ -252,6 +252,7 @@ func CheckExpiredJWTIsExpired(r *Context) (Result, error) {
 		return result, err
 	}
 	if expiry.After(time.Now()) {
+		err := errors.New("expected expired token to have an expiry in the past")
 		result.message = err.Error()
 		return result, fmt.Errorf("expected expired token to have an expiry in the past")
 	}
