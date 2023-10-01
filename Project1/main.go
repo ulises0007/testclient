@@ -246,6 +246,11 @@ func CheckExpiredJWTIsExpired(r *Context) (Result, error) {
 		result.message = err.Error()
 		return result, fmt.Errorf("expected expired token to have an expiry")
 	}
+	if expiry == nil {
+		err := errors.New("expected expired JWT to be returned for query param 'expired=true'")
+		result.message = err.Error()
+		return result, err
+	}
 	if expiry.After(time.Now()) {
 		result.message = err.Error()
 		return result, fmt.Errorf("expected expired token to have an expiry in the past")
