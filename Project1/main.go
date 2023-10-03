@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -32,6 +33,13 @@ func main() {
 	if err := kong.Parse(&cli).Run(); err != nil {
 		slog.Error("error running gradebot", slog.String("err", err.Error()))
 	}
+	pauseForInput(os.Stdout, os.Stdin)
+}
+
+func pauseForInput(w io.Writer, r io.Reader) {
+	_, _ = fmt.Fprintf(w, "press any key to continue...")
+	input := bufio.NewScanner(r)
+	input.Scan()
 }
 
 type (
