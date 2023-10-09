@@ -2,19 +2,25 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/MicahParks/keyfunc/v2"
 	"github.com/alecthomas/kong"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jedib0t/go-pretty/v6/table"
+	_ "modernc.org/sqlite"
 )
 
 const (
@@ -22,15 +28,33 @@ const (
 	JWKSEndpoint = "/.well-known/jwks.json"
 )
 
-type grammar struct {
-	Port  int  `env:"PORT" short:"p" help:"Port to check." default:"8080"`
-	Debug bool `help:"Debug output."`
-	Total bool `help:"Print total only"`
-}
+type (
+	grammar struct {
+		Project1 Project1Cmd `name:"project1" cmd:"" help:"Run the Project 1 checkers."`
+		Project2 Project2Cmd `name:"project2" cmd:"" help:"Run the Project 2 checkers."`
+	}
+	options struct {
+		Port  int  `env:"PORT" short:"p" help:"Port to check." default:"8080"`
+		Debug bool `help:"Debug output."`
+		Total bool `help:"Print total only"`
+	}
+	Project1Cmd struct {
+		options
+	}
+	Project2Cmd struct {
+		options
+		DatabaseFile string `help:"Path to the database file."         default:"totally_not_my_privateKeys.db"`
+		CodeDir      string `help:"Path to the source code directory." default:"."`
+	}
+)
 
 func main() {
 	var cli grammar
-	if err := kong.Parse(&cli).Run(); err != nil {
+	if err := kong.Parse(&cli,
+		kong.Name("gradebot"),
+		kong.Description("Gradebot 9000 is a tool to grade your 3550 projects."),
+		kong.UsageOnError(),
+	).Run(); err != nil {
 		slog.Error("error running gradebot", slog.String("err", err.Error()))
 	}
 	pauseForInput(os.Stdout, os.Stdin)
@@ -44,9 +68,11 @@ func pauseForInput(w io.Writer, r io.Reader) {
 
 type (
 	Context struct {
-		hostURL    string
-		validJWT   *jwt.Token
-		expiredJWT *jwt.Token
+		hostURL      string
+		validJWT     *jwt.Token
+		expiredJWT   *jwt.Token
+		databaseFile string
+		srcDir       string
 	}
 	Check  func(*Context) (Result, error)
 	Result struct {
@@ -57,27 +83,32 @@ type (
 	}
 )
 
-func (g grammar) Run() error {
+func (o *options) setup() {
 	// Set up logging.
 	lvl := new(slog.LevelVar)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: lvl,
 	}))
-	if g.Debug {
+	if o.Debug {
 		lvl.Set(slog.LevelDebug)
 	}
-	if g.Total {
+	if o.Total {
 		lvl.Set(10)
 	}
 	slog.SetDefault(logger)
+}
+
+func (cmd Project1Cmd) Run() error {
+	cmd.options.setup()
 
 	var (
 		rubric  Context
 		results = make([]Result, 0)
 	)
-	rubric.hostURL = fmt.Sprintf("http://127.0.0.1:%d", g.Port)
+	rubric.hostURL = fmt.Sprintf("http://127.0.0.1:%d", cmd.Port)
 	for _, check := range []Check{
-		CheckAuthentication,
+		CheckValidJWT,
+		CheckExpiredJWT,
 		CheckProperHTTPMethodsAndStatusCodes,
 		CheckValidJWKFoundInJWKS,
 		CheckExpiredJWTIsExpired,
@@ -90,13 +121,45 @@ func (g grammar) Run() error {
 		results = append(results, result)
 	}
 
-	if g.Total {
+	printRubricResults(cmd.Total, results...)
+
+	return nil
+}
+
+func (cmd Project2Cmd) Run() error {
+	cmd.options.setup()
+
+	rubric := Context{
+		databaseFile: cmd.DatabaseFile,
+		srcDir:       cmd.CodeDir,
+	}
+	results := make([]Result, 0)
+	rubric.hostURL = fmt.Sprintf("http://127.0.0.1:%d", cmd.Port)
+	for _, check := range []Check{
+		CheckValidJWT,
+		CheckValidJWKFoundInJWKS,
+		CheckDatabaseExists,
+		CheckDatabaseQueryUsesParameters,
+	} {
+		result, err := check(&rubric)
+		if err != nil {
+			slog.Error(result.label, slog.String("err", err.Error()))
+		}
+		results = append(results, result)
+	}
+
+	printRubricResults(cmd.Total, results...)
+
+	return nil
+}
+func printRubricResults(onlyTotal bool, results ...Result) {
+	if onlyTotal {
 		totalPoints := 0
 		for i := range results {
 			totalPoints += results[i].awarded
 		}
 		fmt.Println(totalPoints)
-		return nil
+		return
 	}
 
 	t := table.NewWriter()
@@ -115,15 +178,117 @@ func (g grammar) Run() error {
 	t.AppendFooter(table.Row{"", "Possible", possiblePoints})
 	t.AppendFooter(table.Row{"", "Awarded", totalPoints})
 	fmt.Println(t.Render())
-
-	return nil
 }
 
-func CheckAuthentication(r *Context) (Result, error) {
+//region Checkers
+
+func CheckDatabaseExists(c *Context) (Result, error) {
 	result := Result{
-		label:    "/auth JWT authN",
+		label:    "Database exists",
 		awarded:  0,
-		possible: 20,
+		possible: 15,
+	}
+	if _, err := os.Stat(c.databaseFile); err != nil {
+		result.message = err.Error()
+		return result, err
+	}
+	result.awarded += 5
+
+	db, err := sql.Open("sqlite", c.databaseFile)
+	if err != nil {
+		result.message = err.Error()
+		return result, err
+	}
+	rows, err := db.Query("SELECT * FROM keys")
+	if err != nil {
+		return result, err
+	}
+	var (
+		validKey   bool
+		expiredKey bool
+	)
+	for rows.Next() {
+		var (
+			kid int
+			key string
+			exp int64
+		)
+		if err := rows.Scan(&kid, &key, &exp); err != nil {
+			return result, err
+		}
+		slog.Debug("Found key in DB",
+			slog.Int("kid", kid),
+			slog.String("key", trimPEMKey(key)),
+			slog.Int64("exp", exp),
+		)
+		if t := time.Unix(exp, 0); time.Now().After(t) {
+			expiredKey = true
+		} else {
+			validKey = true
+		}
+	}
+	if validKey {
+		result.awarded += 5
+		slog.Debug("Valid key found in DB", slog.Int("pts", 5))
+	}
+	if expiredKey {
+		result.awarded += 5
+		slog.Debug("Expired key found in DB", slog.Int("pts", 5))
+	}
+
+	return result, nil
+}
+
+func trimPEMKey(key string) string {
+	key = strings.ReplaceAll(key, "\n", "")
+	key = strings.ReplaceAll(key, "\r", "")
+	key = strings.ReplaceAll(key, "\t", "")
+	key = strings.ReplaceAll(key, " ", "")
+	key = strings.TrimLeft(key, "-----BEGIN RSA PRIVATE KEY-----")
+	key = strings.TrimRight(key, "-----END RSA PRIVATE KEY-----")
+
+	return key[0:15] + "..." + key[len(key)-15:]
+}
+
+func CheckDatabaseQueryUsesParameters(c *Context) (Result, error) {
+	result := Result{
+		label:    "Database query uses parameters",
+		awarded:  0,
+		possible: 15,
+	}
+
+	var foundParams bool
+	if err := fs.WalkDir(os.DirFS(c.srcDir), ".", func(p string, d fs.DirEntry, err error) error {
+		if d.IsDir() {
+			return nil
+		}
+		b, err := os.ReadFile(filepath.Join(c.srcDir, p))
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(b, []byte("INSERT INTO keys(key, exp) values(?,?)")) {
+			slog.Debug("Found SQL insertion query parameters", slog.String("file", p))
+			foundParams = true
+		}
+
+		return nil
+	}); err != nil {
+		return result, err
+	}
+	if foundParams {
+		result.awarded += 15
+	} else {
+		result.message = "No sources files found with SQL insertion parameters"
+	}
+
+	return result, nil
+}
+
+func CheckValidJWT(r *Context) (Result, error) {
+	result := Result{
+		label:    "/auth valid JWT authN",
+		awarded:  0,
+		possible: 15,
 	}
 	var err error
 	if r.validJWT, err = authentication(r.hostURL, false); err != nil && !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
@@ -133,6 +298,17 @@ func CheckAuthentication(r *Context) (Result, error) {
 	result.awarded += 15
 	slog.Debug("Valid JWT", slog.Int("pts", 15))
 
+	return result, nil
+}
+
+func CheckExpiredJWT(r *Context) (Result, error) {
+	result := Result{
+		label:    "/auth?expired=true JWT authN (expired)",
+		awarded:  0,
+		possible: 5,
+	}
+
+	var err error
 	r.expiredJWT, err = authentication(r.hostURL, true)
 	if r.expiredJWT == nil {
 		result.message = "expected expired JWT to exist"
@@ -305,6 +481,8 @@ func CheckExpiredJWKNotFoundInJWKS(r *Context) (Result, error) {
 
 	return result, nil
 }
+
+//endregion
 
 func printJWT(name string, token *jwt.Token) {
 	fmt.Printf("\t%v JWT valid: %v\n", name, token.Valid)
