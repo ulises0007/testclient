@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -250,6 +251,8 @@ func trimPEMKey(key string) string {
 	return key[0:15] + "..." + key[len(key)-15:]
 }
 
+var parameterizedInsertion = regexp.MustCompile(`INSERT *INTO *keys\((kid, *)*key, *exp\) *values\((\?, *)*\?, *\?\)`)
+
 func CheckDatabaseQueryUsesParameters(c *Context) (Result, error) {
 	result := Result{
 		label:    "Database query uses parameters",
@@ -257,7 +260,6 @@ func CheckDatabaseQueryUsesParameters(c *Context) (Result, error) {
 		possible: 15,
 	}
 
-	var foundParams bool
 	if err := fs.WalkDir(os.DirFS(c.srcDir), ".", func(p string, d fs.DirEntry, err error) error {
 		if d.IsDir() {
 			return nil
@@ -266,18 +268,20 @@ func CheckDatabaseQueryUsesParameters(c *Context) (Result, error) {
 		if err != nil {
 			return err
 		}
-		if bytes.Contains(b, []byte("INSERT INTO keys(key, exp) values(?,?)")) {
-			slog.Debug("Found SQL insertion query parameters", slog.String("file", p))
-			foundParams = true
+		lines := bytes.Split(b, []byte("\n"))
+		for i, line := range lines {
+			if parameterizedInsertion.Match(line) {
+				slog.Debug("Found SQL insertion query", slog.String("file", p), slog.Int("line", i+1))
+				result.awarded = 15
+				break
+			}
 		}
 
 		return nil
 	}); err != nil {
 		return result, err
 	}
-	if foundParams {
-		result.awarded += 15
-	} else {
+	if result.awarded == 0 {
 		result.message = "No sources files found with SQL insertion parameters"
 	}
 
