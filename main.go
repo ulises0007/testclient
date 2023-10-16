@@ -21,6 +21,7 @@ import (
 	"github.com/alecthomas/kong"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/jedib0t/go-pretty/v6/text"
 	_ "modernc.org/sqlite"
 )
 
@@ -164,40 +165,46 @@ func printRubricResults(onlyTotal bool, results ...Result) {
 	}
 
 	t := table.NewWriter()
-	t.AppendHeader(table.Row{"Rubric Item", "Error?", "Points Awarded"})
+	t.AppendHeader(table.Row{"Rubric Item", "Error?", "Possible", "Awarded"})
 	t.SetStyle(table.StyleRounded)
+	t.SetColumnConfigs([]table.ColumnConfig{
+		{Number: 2, AlignFooter: text.AlignRight},
+	})
 
 	var (
 		possiblePoints int
 		totalPoints    int
 	)
 	for i := range results {
-		t.AppendRow([]any{results[i].label, results[i].message, results[i].awarded})
+		t.AppendRow([]any{results[i].label, results[i].message, results[i].possible, results[i].awarded})
 		possiblePoints += results[i].possible
 		totalPoints += results[i].awarded
 	}
-	t.AppendFooter(table.Row{"", "Possible", possiblePoints})
-	t.AppendFooter(table.Row{"", "Awarded", totalPoints})
+	t.AppendFooter(table.Row{"", "Total", possiblePoints, totalPoints})
 	fmt.Println(t.Render())
 }
 
 //region Checkers
 
-func CheckDatabaseExists(c *Context) (Result, error) {
-	result := Result{
+func CheckDatabaseExists(c *Context) (result Result, err error) {
+	result = Result{
 		label:    "Database exists",
 		awarded:  0,
 		possible: 15,
 	}
+	messages := make([]string, 0)
+	defer func() {
+		result.message = strings.Join(messages, "\n")
+	}()
 	if _, err := os.Stat(c.databaseFile); err != nil {
-		result.message = err.Error()
+		messages = append(messages, err.Error())
 		return result, err
 	}
 	result.awarded += 5
 
 	db, err := sql.Open("sqlite", c.databaseFile)
 	if err != nil {
-		result.message = err.Error()
+		messages = append(messages, err.Error())
 		return result, err
 	}
 	rows, err := db.Query("SELECT * FROM keys")
@@ -217,24 +224,30 @@ func CheckDatabaseExists(c *Context) (Result, error) {
 		if err := rows.Scan(&kid, &key, &exp); err != nil {
 			return result, err
 		}
+		expired := time.Now().After(time.Unix(exp, 0))
 		slog.Debug("Found key in DB",
 			slog.Int("kid", kid),
 			slog.String("key", trimPEMKey(key)),
 			slog.Int64("exp", exp),
+			slog.Bool("expired", expired),
 		)
-		if t := time.Unix(exp, 0); time.Now().After(t) {
+		if !expiredKey && expired {
 			expiredKey = true
-		} else {
+		} else if !validKey && !expired {
 			validKey = true
 		}
 	}
 	if validKey {
 		result.awarded += 5
-		slog.Debug("Valid key found in DB", slog.Int("pts", 5))
+		slog.Debug("Valid priv key found in DB", slog.Int("pts", 5))
+	} else {
+		messages = append(messages, "no valid priv key found in DB")
 	}
 	if expiredKey {
 		result.awarded += 5
-		slog.Debug("Expired key found in DB", slog.Int("pts", 5))
+		slog.Debug("Expired priv key found in DB", slog.Int("pts", 5))
+	} else {
+		messages = append(messages, "no expired priv key found in DB")
 	}
 
 	return result, nil
