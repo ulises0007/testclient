@@ -251,7 +251,7 @@ func trimPEMKey(key string) string {
 	return key[0:15] + "..." + key[len(key)-15:]
 }
 
-var parameterizedInsertion = regexp.MustCompile(`INSERT *INTO *keys\((kid, *)*key, *exp\) *values\((\?, *)*\?, *\?\)`)
+var parameterizedInsertion = regexp.MustCompile(`(?i)INSERT *(OR *REPLACE *)?INTO *(?-i)keys(?i) *(\( *key, *exp *\) *VALUES *\(\?, *\? *\)|\( *kid, *key, *exp *\) *VALUES *\(\?, *\?, *\? *\))`)
 
 func CheckDatabaseQueryUsesParameters(c *Context) (Result, error) {
 	result := Result{
