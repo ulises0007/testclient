@@ -214,6 +214,7 @@ func CheckDatabaseExists(c *Context) (result Result, err error) {
 	var (
 		validKey   bool
 		expiredKey bool
+		now        = time.Now().UTC()
 	)
 	for rows.Next() {
 		var (
@@ -224,11 +225,13 @@ func CheckDatabaseExists(c *Context) (result Result, err error) {
 		if err := rows.Scan(&kid, &key, &exp); err != nil {
 			return result, err
 		}
-		expired := time.Now().After(time.Unix(exp, 0))
+		expiredAt := time.Unix(exp, 0)
+		expired := now.After(expiredAt)
 		slog.Debug("Found key in DB",
 			slog.Int("kid", kid),
 			slog.String("key", trimPEMKey(key)),
 			slog.Int64("exp", exp),
+			slog.String("expired_at", expiredAt.String()),
 			slog.Bool("expired", expired),
 		)
 		if !expiredKey && expired {
