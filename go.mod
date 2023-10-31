@@ -8,6 +8,7 @@ require (
 	github.com/alecthomas/kong v0.8.0
 	github.com/golang-jwt/jwt/v5 v5.0.0
 	github.com/jedib0t/go-pretty/v6 v6.4.7
+	github.com/jmoiron/sqlx v1.3.5
 	modernc.org/sqlite v1.26.0
 )
 

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,20 +21,24 @@ import (
 	"github.com/MicahParks/keyfunc/v2"
 	"github.com/alecthomas/kong"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
+	"github.com/jmoiron/sqlx"
 	_ "modernc.org/sqlite"
 )
 
 const (
-	AuthEndpoint = "/auth"
-	JWKSEndpoint = "/.well-known/jwks.json"
+	RegistrationEndpoint = "/register"
+	AuthEndpoint         = "/auth"
+	JWKSEndpoint         = "/.well-known/jwks.json"
 )
 
 type (
 	grammar struct {
 		Project1 Project1Cmd `name:"project1" cmd:"" help:"Run the Project 1 checkers."`
 		Project2 Project2Cmd `name:"project2" cmd:"" help:"Run the Project 2 checkers."`
+		Project3 Project3Cmd `name:"project3" cmd:"" help:"Run the Project 3 checkers."`
 	}
 	options struct {
 		Port  int  `env:"PORT" short:"p" help:"Port to check." default:"8080"`
@@ -44,6 +49,11 @@ type (
 		options
 	}
 	Project2Cmd struct {
+		options
+		DatabaseFile string `help:"Path to the database file."         default:"totally_not_my_privateKeys.db"`
+		CodeDir      string `help:"Path to the source code directory." default:"."`
+	}
+	Project3Cmd struct {
 		options
 		DatabaseFile string `help:"Path to the database file."         default:"totally_not_my_privateKeys.db"`
 		CodeDir      string `help:"Path to the source code directory." default:"."`
@@ -73,6 +83,8 @@ type (
 		hostURL      string
 		validJWT     *jwt.Token
 		expiredJWT   *jwt.Token
+		username     string
+		password     string
 		databaseFile string
 		srcDir       string
 	}
@@ -154,6 +166,38 @@ func (cmd Project2Cmd) Run() error {
 
 	return nil
 }
+
+func (cmd Project3Cmd) Run() error {
+	cmd.options.setup()
+
+	rubric := Context{
+		databaseFile: cmd.DatabaseFile,
+		srcDir:       cmd.CodeDir,
+		username:     "testor_" + uuid.NewString()[0:8],
+	}
+	slog.Debug("using username", slog.String("username", rubric.username))
+	results := make([]Result, 0)
+	rubric.hostURL = fmt.Sprintf("http://127.0.0.1:%d", cmd.Port)
+	for _, check := range []Check{
+		CheckTableExists("users", 5),
+		CheckRegistrationWorks,
+		CheckPrivateKeysAreEncrypted,
+		CheckTableExists("auth_logs", 5),
+		CheckAuthRequestsAreLogged,
+		CheckEndpointIsRateLimited("/auth", 10),
+	} {
+		result, err := check(&rubric)
+		if err != nil {
+			slog.Error(result.label, slog.String("err", err.Error()))
+		}
+		results = append(results, result)
+	}
+
+	printRubricResults(cmd.Total, results...)
+
+	return nil
+}
+
 func printRubricResults(onlyTotal bool, results ...Result) {
 	if onlyTotal {
 		totalPoints := 0
@@ -256,13 +300,18 @@ func CheckDatabaseExists(c *Context) (result Result, err error) {
 	return result, nil
 }
 
+const (
+	rsaPrefix = "-----BEGIN RSA PRIVATE KEY-----"
+	rsaSuffix = "-----END RSA PRIVATE KEY-----"
+)
+
 func trimPEMKey(key string) string {
 	key = strings.ReplaceAll(key, "\n", "")
 	key = strings.ReplaceAll(key, "\r", "")
 	key = strings.ReplaceAll(key, "\t", "")
 	key = strings.ReplaceAll(key, " ", "")
-	key = strings.TrimLeft(key, "-----BEGIN RSA PRIVATE KEY-----")
-	key = strings.TrimRight(key, "-----END RSA PRIVATE KEY-----")
+	key = strings.TrimPrefix(key, rsaPrefix)
+	key = strings.TrimSuffix(key, rsaSuffix)
 
 	return key[0:15] + "..." + key[len(key)-15:]
 }
@@ -277,6 +326,9 @@ func CheckDatabaseQueryUsesParameters(c *Context) (Result, error) {
 	}
 
 	if err := fs.WalkDir(os.DirFS(c.srcDir), ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
 		if d.IsDir() {
 			return nil
 		}
@@ -304,14 +356,14 @@ func CheckDatabaseQueryUsesParameters(c *Context) (Result, error) {
 	return result, nil
 }
 
-func CheckValidJWT(r *Context) (Result, error) {
+func CheckValidJWT(c *Context) (Result, error) {
 	result := Result{
 		label:    "/auth valid JWT authN",
 		awarded:  0,
 		possible: 15,
 	}
 	var err error
-	if r.validJWT, err = authentication(r.hostURL, false); err != nil && !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+	if c.validJWT, err = authentication(c.hostURL, false); err != nil && !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
 		result.message = err.Error()
 		return result, err
 	}
@@ -321,7 +373,7 @@ func CheckValidJWT(r *Context) (Result, error) {
 	return result, nil
 }
 
-func CheckExpiredJWT(r *Context) (Result, error) {
+func CheckExpiredJWT(c *Context) (Result, error) {
 	result := Result{
 		label:    "/auth?expired=true JWT authN (expired)",
 		awarded:  0,
@@ -329,14 +381,14 @@ func CheckExpiredJWT(r *Context) (Result, error) {
 	}
 
 	var err error
-	r.expiredJWT, err = authentication(r.hostURL, true)
-	if r.expiredJWT == nil {
+	c.expiredJWT, err = authentication(c.hostURL, true)
+	if c.expiredJWT == nil {
 		result.message = "expected expired JWT to exist"
 		return result, fmt.Errorf("expected expired JWT to exist")
 	} else if err == nil {
 		result.message = "expected expired JWT to error"
 		return result, fmt.Errorf("expected expired JWT to error")
-	} else if r.expiredJWT.Valid {
+	} else if c.expiredJWT.Valid {
 		result.message = "expected expired JWT to be invalid"
 		return result, fmt.Errorf("expected expired JWT to be invalid")
 	}
@@ -346,7 +398,7 @@ func CheckExpiredJWT(r *Context) (Result, error) {
 	return result, nil
 }
 
-func CheckProperHTTPMethodsAndStatusCodes(ctx *Context) (Result, error) {
+func CheckProperHTTPMethodsAndStatusCodes(c *Context) (Result, error) {
 	result := Result{
 		label:    "Proper HTTP methods/Status codes",
 		awarded:  1, // free point to make the math even.
@@ -378,7 +430,7 @@ func CheckProperHTTPMethodsAndStatusCodes(ctx *Context) (Result, error) {
 				slog.String("endpoint", endpoint),
 				slog.String("method", method),
 			)
-			req, err := http.NewRequest(method, ctx.hostURL+endpoint, http.NoBody)
+			req, err := http.NewRequest(method, c.hostURL+endpoint, http.NoBody)
 			if err != nil {
 				logger.Error("could not create request", slog.String("err", err.Error()))
 				continue
@@ -403,24 +455,24 @@ func CheckProperHTTPMethodsAndStatusCodes(ctx *Context) (Result, error) {
 	return result, nil
 }
 
-func CheckValidJWKFoundInJWKS(r *Context) (Result, error) {
+func CheckValidJWKFoundInJWKS(c *Context) (Result, error) {
 	result := Result{
 		label:    "Valid JWK found in JWKS",
 		awarded:  0,
 		possible: 20,
 	}
-	if r.validJWT == nil {
+	if c.validJWT == nil {
 		result.message = "no valid JWT found"
 		return result, fmt.Errorf("no valid JWT found")
 	}
 
-	jwks, err := keyfunc.Get(r.hostURL+JWKSEndpoint, keyfunc.Options{})
+	jwks, err := keyfunc.Get(c.hostURL+JWKSEndpoint, keyfunc.Options{})
 	if err != nil {
 		result.message = err.Error()
 		return result, fmt.Errorf("JWKS: %w", err)
 	}
 
-	token, err := jwt.ParseWithClaims(r.validJWT.Raw, &jwt.RegisteredClaims{}, jwks.Keyfunc)
+	token, err := jwt.ParseWithClaims(c.validJWT.Raw, &jwt.RegisteredClaims{}, jwks.Keyfunc)
 	if err != nil {
 		result.message = err.Error()
 		return result, fmt.Errorf("failed to validate token: %w", err)
@@ -435,17 +487,17 @@ func CheckValidJWKFoundInJWKS(r *Context) (Result, error) {
 	return result, nil
 }
 
-func CheckExpiredJWTIsExpired(r *Context) (Result, error) {
+func CheckExpiredJWTIsExpired(c *Context) (Result, error) {
 	result := Result{
 		label:    "Expired JWT is expired",
 		awarded:  0,
 		possible: 5,
 	}
-	if r.expiredJWT == nil {
+	if c.expiredJWT == nil {
 		result.message = "no expired JWT found"
 		return result, fmt.Errorf("no expired JWT found")
 	}
-	expiry, err := r.expiredJWT.Claims.GetExpirationTime()
+	expiry, err := c.expiredJWT.Claims.GetExpirationTime()
 	if err != nil {
 		result.message = err.Error()
 		return result, fmt.Errorf("expected expired token to have an expiry")
@@ -462,31 +514,31 @@ func CheckExpiredJWTIsExpired(r *Context) (Result, error) {
 	}
 	result.awarded += 5
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
-		printJWT("Expired", r.expiredJWT)
+		printJWT("Expired", c.expiredJWT)
 	}
 	slog.Debug("Expired JWT actually expired", slog.Int("pts", 5))
 
 	return result, nil
 }
 
-func CheckExpiredJWKNotFoundInJWKS(r *Context) (Result, error) {
+func CheckExpiredJWKNotFoundInJWKS(c *Context) (Result, error) {
 	result := Result{
 		label:    "Expired JWK does not exist in JWKS",
 		awarded:  0,
 		possible: 10,
 	}
-	if r.expiredJWT == nil {
+	if c.expiredJWT == nil {
 		result.message = "no expired JWT found"
 		return result, fmt.Errorf("no expired JWT found")
 	}
 
-	jwks, err := keyfunc.Get(r.hostURL+JWKSEndpoint, keyfunc.Options{})
+	jwks, err := keyfunc.Get(c.hostURL+JWKSEndpoint, keyfunc.Options{})
 	if err != nil {
 		result.message = err.Error()
 		return result, fmt.Errorf("JWKS error: %w", err)
 	}
 
-	_, err = jwt.ParseWithClaims(r.expiredJWT.Raw, &jwt.RegisteredClaims{}, jwks.Keyfunc)
+	_, err = jwt.ParseWithClaims(c.expiredJWT.Raw, &jwt.RegisteredClaims{}, jwks.Keyfunc)
 	switch {
 	case errors.Is(err, keyfunc.ErrKIDNotFound):
 		result.awarded += 10
@@ -500,6 +552,251 @@ func CheckExpiredJWKNotFoundInJWKS(r *Context) (Result, error) {
 	}
 
 	return result, nil
+}
+
+type key struct {
+	KID                  int64  `db:"kid"`
+	EncipheredPrivateKey []byte `db:"key"`
+	Expiration           int64  `db:"exp"`
+}
+
+func CheckPrivateKeysAreEncrypted(c *Context) (Result, error) {
+	result := Result{
+		label:    "Private Keys are encrypted in the database",
+		awarded:  0,
+		possible: 25,
+	}
+
+	keys, err := dbSelect[key](c, "keys", nil)
+	if err != nil {
+		result.message = err.Error()
+		return result, err
+	}
+	if len(keys) == 0 {
+		result.message = "no keys found in database"
+		return result, nil
+	}
+
+	// check if any of the keys are not encrypted
+	for _, k := range keys {
+		if bytes.HasPrefix(bytes.TrimSpace(k.EncipheredPrivateKey), []byte(rsaPrefix)) {
+			result.message = fmt.Sprintf("private key %v is not encrypted", k.KID)
+			return result, nil
+		}
+	}
+
+	result.awarded += 25
+
+	return result, nil
+}
+
+func CheckTableExists(table string, points int) func(c *Context) (Result, error) {
+	return func(c *Context) (Result, error) {
+		result := Result{
+			label:    fmt.Sprintf("Create %v table", table),
+			awarded:  0,
+			possible: points,
+		}
+		if _, err := os.Stat(c.databaseFile); err != nil {
+			result.message = err.Error()
+			return result, err
+		}
+
+		db, err := sqlx.Connect("sqlite", "file:"+c.databaseFile)
+		if err != nil {
+			result.message = err.Error()
+			return result, err
+		}
+		defer func() {
+			_ = db.Close()
+		}()
+
+		exists, err := tableExists(db, table)
+		if exists {
+			result.awarded += points
+			slog.Debug("table exists", slog.String("table", table), slog.Int("pts", points))
+			return result, nil
+		}
+
+		result.message = table + " table does not exist"
+		if err != nil {
+			result.message = err.Error()
+			return result, err
+		}
+
+		return result, nil
+	}
+}
+
+func CheckRegistrationWorks(c *Context) (Result, error) {
+	result := Result{
+		label:    "/register endpoint",
+		awarded:  0,
+		possible: 20,
+	}
+
+	resp, err := registration(c.hostURL, c.username)
+	if err != nil {
+		result.message = err.Error()
+		return result, fmt.Errorf("error during registration: %w", err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		result.message = fmt.Sprintf("expected status code %d or %d, got %d", http.StatusOK, http.StatusCreated, resp.StatusCode)
+		return result, nil
+	}
+
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		result.message = err.Error()
+		return result, err
+	}
+
+	if body.Password != "" {
+		result.awarded += 5
+	}
+
+	if _, err := uuid.Parse(body.Password); err != nil {
+		result.message = "password is not a valid UUID"
+		return result, err
+	}
+
+	u, err := dbGet[user](c, "users", "username", c.username)
+	if err != nil {
+		result.message = err.Error()
+		return result, err
+	}
+	result.awarded += 5 // user exists
+
+	if u.PasswordHash == "" {
+		result.message = "password hash is empty"
+		return result, err
+	} else if u.PasswordHash == body.Password {
+		return result, fmt.Errorf("password hash is same as password")
+	}
+
+	result.awarded += 10 // password hash is hashed (hopefully)
+	c.password = body.Password
+
+	return result, nil
+}
+
+type user struct {
+	ID           int64     `db:"id"`
+	Username     string    `db:"username"`
+	PasswordHash string    `db:"password_hash"`
+	Email        string    `db:"email"`
+	RegisteredAt time.Time `db:"date_registered"`
+	LastLoginAt  time.Time `db:"last_login"`
+}
+
+type authLog struct {
+	ID        int64     `db:"id"`
+	RequestIP string    `db:"request_ip"`
+	RequestTS time.Time `db:"request_timestamp"`
+	UserID    int64     `db:"user_id"`
+}
+
+func CheckAuthRequestsAreLogged(c *Context) (Result, error) {
+	result := Result{
+		label:    "/auth requests are logged",
+		awarded:  0,
+		possible: 10,
+	}
+	// initial request to get a valid JWT
+	if resp, err := authenticationWithCreds(c.hostURL, c.username, c.password); err != nil {
+		return result, err
+	} else if resp.StatusCode != http.StatusOK {
+		return result, fmt.Errorf("expected status code %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+
+	user, err := dbGet[user](c, "users", "username", c.username)
+	if err != nil {
+		result.message = err.Error()
+		return result, err
+	}
+
+	slog.Debug("using user ID for auth log", slog.Int64("user_id", user.ID))
+	logs, err := dbSelect[authLog](c, "auth_logs", map[string]any{"user_id": user.ID})
+	if err != nil {
+		result.message = err.Error()
+		return result, err
+	}
+	slog.Debug("logs found", slog.Int("count", len(logs)))
+	if len(logs) == 0 {
+		result.message = "no logs found"
+		return result, nil
+	}
+
+	result.awarded += 5 // log exists
+	slog.Debug("found auth log", slog.Any("log", logs[0]), slog.Int("pts", 5))
+
+	switch {
+	case logs[0].RequestIP == "":
+		result.message = "request IP is empty"
+	case logs[0].RequestTS.IsZero():
+		result.message = "request timestamp is zero"
+	}
+	if result.message == "" {
+		result.awarded += 5
+	}
+
+	return result, nil
+}
+
+func CheckEndpointIsRateLimited(endpoint string, rps int) func(c *Context) (Result, error) {
+	return func(c *Context) (Result, error) {
+		result := Result{
+			label:    endpoint + " is rate-limited (optional)",
+			awarded:  0,
+			possible: 25,
+		}
+
+		// quiesce for a second to let the rate limit recover
+		slog.Debug("quiescing for a second to let the rate limit recover")
+		time.Sleep(time.Second)
+		ticker := time.NewTicker(time.Second / time.Duration(rps))
+		defer ticker.Stop()
+		// do requests that should not error
+		start := time.Now()
+		for i := rps; i > 0; i-- {
+			<-ticker.C
+			resp, err := authenticationWithCreds(c.hostURL, c.username, c.password)
+			if err != nil {
+				return result, err
+			}
+			slog.Debug("pumping rate-limit request",
+				slog.Int("count", i),
+				slog.Any("diff", time.Since(start)),
+				slog.Int("status", resp.StatusCode),
+			)
+			if resp.StatusCode != http.StatusOK {
+				return result, fmt.Errorf("expected status code %d, got %d", http.StatusOK, resp.StatusCode)
+			}
+		}
+
+		// done pumping rate limiter
+		slog.Debug("done pumping rate limiter", slog.Any("diff", time.Since(start)))
+		resp, err := authenticationWithCreds(c.hostURL, c.username, c.password)
+		if err != nil {
+			return result, err
+		}
+		slog.Debug("rate-limited request",
+			slog.Any("diff", time.Since(start)),
+			slog.Int("status", resp.StatusCode),
+		)
+		if resp.StatusCode != http.StatusTooManyRequests {
+			return result, fmt.Errorf("expected status code %d, got %d", http.StatusTooManyRequests, resp.StatusCode)
+		}
+
+		result.awarded += 25 // rate-limited
+
+		return result, nil
+	}
 }
 
 //endregion
@@ -529,6 +826,58 @@ func printJWT(name string, token *jwt.Token) {
 	if claims.ID != "" {
 		fmt.Printf("\t%v JWT ID: %v\n", name, claims.ID)
 	}
+}
+
+func registration(hostURL, username string) (*http.Response, error) {
+	payload := map[string]string{
+		"username": username,
+		"email":    username + "@test.com",
+	}
+	var bb bytes.Buffer
+	if err := json.NewEncoder(&bb).Encode(payload); err != nil {
+		return nil, err
+	}
+	slog.Debug("registration request", slog.Any("body", payload))
+	req, err := http.NewRequest(http.MethodPost, hostURL+RegistrationEndpoint, &bb)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	client := http.Client{
+		Transport: http.DefaultTransport,
+		Timeout:   2 * time.Second, // extra generous timeout for slower languages.
+	}
+
+	return client.Do(req)
+}
+
+func authenticationWithCreds(hostURL, username, password string) (*http.Response, error) {
+	var bb bytes.Buffer
+	if err := json.NewEncoder(&bb).Encode(map[string]string{
+		"username": username,
+		"password": password,
+	}); err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, hostURL+AuthEndpoint, &bb)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	client := http.Client{
+		Transport: http.DefaultTransport,
+		Timeout:   2 * time.Second, // extra generous timeout for slower languages.
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+
+	return resp, nil
 }
 
 func authentication(hostURL string, expired bool) (*jwt.Token, error) {
@@ -564,4 +913,63 @@ func authentication(hostURL string, expired bool) (*jwt.Token, error) {
 	return jwt.ParseWithClaims(string(body), &jwt.RegisteredClaims{}, func(token *jwt.Token) (interface{}, error) {
 		return token, nil
 	})
+}
+
+func tableExists(db *sqlx.DB, tableName string) (bool, error) {
+	var name string
+	if err := db.Get(&name, "SELECT name FROM sqlite_master WHERE type='table' AND name=?", tableName); errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+func dbGet[T any](c *Context, table, field string, value any) (*T, error) {
+	db, err := sqlx.Connect("sqlite", "file:"+c.databaseFile)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	var t T
+	query := fmt.Sprintf(`SELECT * FROM %s WHERE %s=?`, table, field)
+	if err := db.Get(&t, query, value); err != nil {
+		return nil, err
+	}
+
+	return &t, nil
+}
+
+func dbSelect[T any](c *Context, table string, where map[string]any) ([]T, error) {
+	db, err := sqlx.Connect("sqlite", "file:"+c.databaseFile)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	keys := make([]string, 0)
+	values := make([]any, 0)
+	for k, v := range where {
+		keys = append(keys, k)
+		values = append(values, v)
+	}
+	query := "SELECT * FROM " + table
+	if len(keys) > 0 {
+		query += " WHERE "
+		for i := range keys {
+			if i > 0 && i < len(keys) {
+				query += " AND "
+			}
+			query += keys[i] + "=?"
+		}
+	}
+
+	var t []T
+	if err := db.Select(&t, query, values...); err != nil {
+		return t, err
+	}
+
+	return t, nil
 }
