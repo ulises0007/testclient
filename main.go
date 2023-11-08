@@ -380,17 +380,22 @@ func CheckExpiredJWT(c *Context) (Result, error) {
 		possible: 5,
 	}
 
-	var err error
-	c.expiredJWT, err = authentication(c.hostURL, true)
-	if c.expiredJWT == nil {
+	t, err := authentication(c.hostURL, true)
+	switch {
+	case t == nil:
 		result.message = "expected expired JWT to exist"
 		return result, fmt.Errorf("expected expired JWT to exist")
-	} else if err == nil {
+	case t.Header == nil:
+		result.message = "expected expired JWT header to exist"
+		return result, fmt.Errorf("expected expired JWT header to exist")
+	case err == nil:
 		result.message = "expected expired JWT to error"
 		return result, fmt.Errorf("expected expired JWT to error")
-	} else if c.expiredJWT.Valid {
+	case t.Valid:
 		result.message = "expected expired JWT to be invalid"
 		return result, fmt.Errorf("expected expired JWT to be invalid")
+	default:
+		c.expiredJWT = t
 	}
 	result.awarded += 5
 	slog.Debug("Expired JWT", slog.Int("pts", 5))
@@ -890,6 +895,7 @@ func authentication(hostURL string, expired bool) (*jwt.Token, error) {
 		q.Add("expired", "true")
 		req.URL.RawQuery = q.Encode()
 	}
+	req.Header.Set("accept-type", "application/json")
 	client := http.Client{
 		Transport: http.DefaultTransport,
 		Timeout:   2 * time.Second, // extra generous timeout for slower languages.
@@ -909,8 +915,31 @@ func authentication(hostURL string, expired bool) (*jwt.Token, error) {
 	if err != nil {
 		return nil, err
 	}
+	slog.Debug("Received POST:/auth body", slog.Int("status", resp.StatusCode), slog.String("body", string(body)))
+	var jsonBody struct {
+		JWT   string `json:"jwt"`
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(body, &jsonBody); err == nil {
+		// Must not be JSON, try to parse as JWT
+		switch {
+		case jsonBody.JWT != "":
+			return jwt.ParseWithClaims(jsonBody.JWT, &jwt.RegisteredClaims{}, func(token *jwt.Token) (any, error) {
+				return token, nil
+			})
+		case jsonBody.Token != "":
+			return jwt.ParseWithClaims(jsonBody.Token, &jwt.RegisteredClaims{}, func(token *jwt.Token) (any, error) {
+				return token, nil
+			})
+		default:
+		}
+	}
 
-	return jwt.ParseWithClaims(string(body), &jwt.RegisteredClaims{}, func(token *jwt.Token) (interface{}, error) {
+	if len(strings.Split(string(body), ".")) != 3 {
+		return nil, errors.New(`no JWT found in response. Tried raw, JSON["jwt"] and JSON["token"]`)
+	}
+
+	return jwt.ParseWithClaims(string(body), &jwt.RegisteredClaims{}, func(token *jwt.Token) (any, error) {
 		return token, nil
 	})
 }
