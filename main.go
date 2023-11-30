@@ -12,6 +12,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -32,6 +34,8 @@ const (
 	RegistrationEndpoint = "/register"
 	AuthEndpoint         = "/auth"
 	JWKSEndpoint         = "/.well-known/jwks.json"
+	Username             = "userABC"
+	Password             = "password123"
 )
 
 type (
@@ -480,6 +484,14 @@ func CheckValidJWKFoundInJWKS(c *Context) (Result, error) {
 	token, err := jwt.ParseWithClaims(c.validJWT.Raw, &jwt.RegisteredClaims{}, jwks.Keyfunc)
 	if err != nil {
 		result.message = err.Error()
+		resp, err2 := http.Get(c.hostURL + JWKSEndpoint)
+		if err2 != nil {
+			return result, fmt.Errorf("failed to get JWKS endpoint: %w", err2)
+		}
+		b, _ := httputil.DumpResponse(resp, true)
+		if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+			fmt.Println("JWKS Response:\n", string(b))
+		}
 		return result, fmt.Errorf("failed to validate token: %w", err)
 	}
 
@@ -653,10 +665,16 @@ func CheckRegistrationWorks(c *Context) (Result, error) {
 		return result, nil
 	}
 
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		result.message = err.Error()
+		return result, err
+	}
+	slog.Debug("registration response", slog.String("body", string(b)))
 	var body struct {
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(b, &body); err != nil {
 		result.message = err.Error()
 		return result, err
 	}
@@ -691,12 +709,12 @@ func CheckRegistrationWorks(c *Context) (Result, error) {
 }
 
 type user struct {
-	ID           int64     `db:"id"`
-	Username     string    `db:"username"`
-	PasswordHash string    `db:"password_hash"`
-	Email        string    `db:"email"`
-	RegisteredAt time.Time `db:"date_registered"`
-	LastLoginAt  time.Time `db:"last_login"`
+	ID           int64      `db:"id"`
+	Username     string     `db:"username"`
+	PasswordHash string     `db:"password_hash"`
+	Email        string     `db:"email"`
+	RegisteredAt time.Time  `db:"date_registered"`
+	LastLoginAt  *time.Time `db:"last_login"`
 }
 
 type authLog struct {
@@ -886,27 +904,17 @@ func authenticationWithCreds(hostURL, username, password string) (*http.Response
 }
 
 func authentication(hostURL string, expired bool) (*jwt.Token, error) {
-	req, err := http.NewRequest(http.MethodPost, hostURL+AuthEndpoint, http.NoBody)
-	if err != nil {
-		return nil, fmt.Errorf("error creating request: %w", err)
-	}
-	if expired {
-		q := req.URL.Query()
-		q.Add("expired", "true")
-		req.URL.RawQuery = q.Encode()
-	}
-	req.Header.Set("accept-type", "application/json")
-	client := http.Client{
-		Transport: http.DefaultTransport,
-		Timeout:   2 * time.Second, // extra generous timeout for slower languages.
-	}
-	resp, err := client.Do(req)
+	// try post form + basic auth
+	resp, err := autheticatePostForm(hostURL, expired)
 	if err != nil {
 		return nil, err
 	}
-
-	if err != nil {
-		return nil, fmt.Errorf("error authenticating: %w", err)
+	if resp.StatusCode != http.StatusOK {
+		// try post json
+		resp, err = autheticatePostJSON(hostURL, expired)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer func() {
 		_ = resp.Body.Close()
@@ -944,6 +952,63 @@ func authentication(hostURL string, expired bool) (*jwt.Token, error) {
 	})
 }
 
+func autheticatePostJSON(hostURL string, expired bool) (*http.Response, error) {
+	var bb bytes.Buffer
+	if err := json.NewEncoder(&bb).Encode(struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}{
+		Username: Username,
+		Password: Password,
+	}); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, hostURL+AuthEndpoint, &bb)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept-Type", "application/json")
+	if expired {
+		q := req.URL.Query()
+		q.Add("expired", "true")
+		req.URL.RawQuery = q.Encode()
+	}
+
+	client := http.Client{
+		Transport: http.DefaultTransport,
+		Timeout:   2 * time.Second, // extra generous timeout for slower languages.
+	}
+
+	return client.Do(req)
+}
+
+func autheticatePostForm(hostURL string, expired bool) (*http.Response, error) {
+	data := url.Values{}
+	data.Set("username", Username)
+	data.Set("password", Password)
+
+	req, err := http.NewRequest(http.MethodPost, hostURL+AuthEndpoint, strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	req.SetBasicAuth(Username, Password)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept-Type", "application/json")
+	if expired {
+		q := req.URL.Query()
+		q.Add("expired", "true")
+		req.URL.RawQuery = q.Encode()
+	}
+
+	client := http.Client{
+		Transport: http.DefaultTransport,
+		Timeout:   2 * time.Second, // extra generous timeout for slower languages.
+	}
+
+	return client.Do(req)
+}
+
 func tableExists(db *sqlx.DB, tableName string) (bool, error) {
 	var name string
 	if err := db.Get(&name, "SELECT name FROM sqlite_master WHERE type='table' AND name=?", tableName); errors.Is(err, sql.ErrNoRows) {
@@ -960,7 +1025,9 @@ func dbGet[T any](c *Context, table, field string, value any) (*T, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
+	defer func() {
+		_ = db.Close()
+	}()
 
 	var t T
 	query := fmt.Sprintf(`SELECT * FROM %s WHERE %s=?`, table, field)
@@ -976,7 +1043,9 @@ func dbSelect[T any](c *Context, table string, where map[string]any) ([]T, error
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
+	defer func() {
+		_ = db.Close()
+	}()
 
 	keys := make([]string, 0)
 	values := make([]any, 0)
