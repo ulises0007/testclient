@@ -865,6 +865,9 @@ func registration(hostURL, username string) (*http.Response, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept-Type", "application/json")
+
 	client := http.Client{
 		Transport: http.DefaultTransport,
 		Timeout:   2 * time.Second, // extra generous timeout for slower languages.
@@ -886,6 +889,9 @@ func authenticationWithCreds(hostURL, username, password string) (*http.Response
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept-Type", "application/json")
+
 	client := http.Client{
 		Transport: http.DefaultTransport,
 		Timeout:   2 * time.Second, // extra generous timeout for slower languages.
