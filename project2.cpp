@@ -5,6 +5,7 @@
 #include <httplib.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <sqlite3.h>
 
 using namespace std;
 
@@ -91,16 +92,29 @@ string base64_url_encode(const string &data)
 
 int main()
 {
-    // Generate RSA key pair
-    EVP_PKEY *pkey = EVP_PKEY_new();
-    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
-    EVP_PKEY_keygen_init(ctx);
-    EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048);
-    EVP_PKEY_keygen(ctx, &pkey);
-    EVP_PKEY_CTX_free(ctx);
+    // Initialize SQLite database and create the 'keys' table
+    sqlite3 *db;
+    int rc = sqlite3_open("totally_not_my_privateKeys.db", &db);
+    if (rc != SQLITE_OK)
+    {
+        cerr << "Error opening SQLite database: " << sqlite3_errmsg(db) << endl;
+        sqlite3_close(db);
+        return 1;
+    }
 
-    string pub_key = extract_pub_key(pkey);
-    string priv_key = extract_priv_key(pkey);
+    const char *create_table_sql =
+        "CREATE TABLE IF NOT EXISTS keys("
+        "kid INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "key TEXT NOT NULL,"
+        "exp INTEGER NOT NULL"
+        ")";
+    rc = sqlite3_exec(db, create_table_sql, NULL, NULL, NULL);
+    if (rc != SQLITE_OK)
+    {
+        cerr << "Error creating keys table: " << sqlite3_errmsg(db) << endl;
+        sqlite3_close(db);
+        return 1;
+    }
 
     // Start HTTP server
     httplib::Server svr;
@@ -116,6 +130,31 @@ int main()
                  // Check if the "expired" query parameter is set to "true"
                  bool expired = req.has_param("expired") && req.get_param_value("expired") == "true";
 
+                 // Read private key from the database
+                 sqlite3_stmt *stmt;
+                 const char *select_key_sql = "SELECT key FROM keys WHERE exp > ? LIMIT 1";
+                 rc = sqlite3_prepare_v2(db, select_key_sql, -1, &stmt, NULL);
+                 if (rc != SQLITE_OK)
+                 {
+                     cerr << "Error preparing SQL statement: " << sqlite3_errmsg(db) << endl;
+                     sqlite3_finalize(stmt);
+                     sqlite3_close(db);
+                     return;
+                 }
+
+                 sqlite3_bind_int(stmt, 1, expired ? 0 : std::time(nullptr));
+
+                 rc = sqlite3_step(stmt);
+                 if (rc != SQLITE_ROW)
+                 {
+                     cerr << "Error retrieving key from database: " << sqlite3_errmsg(db) << endl;
+                     sqlite3_finalize(stmt);
+                     sqlite3_close(db);
+                     return;
+                 }
+
+                 string priv_key_str = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 0));
+
                  // Create JWT token
                  auto now = chrono::system_clock::now();
                  auto token = jwt::create()
@@ -125,47 +164,11 @@ int main()
                                   .set_issued_at(chrono::system_clock::now())
                                   .set_expires_at(expired ? now - chrono::seconds{1} : now + chrono::hours{24})
                                   .set_key_id(expired ? "expiredKID" : "goodKID")
-                                  .sign(jwt::algorithm::rs256(pub_key, priv_key));
+                                  .sign(jwt::algorithm::rs256(priv_key_str, priv_key_str));
 
                  res.set_content(token, "text/plain");
              });
 
     svr.Get("/.well-known/jwks.json", [&](const httplib::Request &, httplib::Response &res)
             {
-                BIGNUM *n = NULL;
-                BIGNUM *e = NULL;
-
-                if (!EVP_PKEY_get_bn_param(pkey, "n", &n) || !EVP_PKEY_get_bn_param(pkey, "e", &e))
-                {
-                    res.set_content("Error retrieving JWKS", "text/plain");
-                    return;
-                }
-
-                string n_encoded = base64_url_encode(bignum_to_raw_string(n));
-                string e_encoded = base64_url_encode(bignum_to_raw_string(e));
-
-                BN_free(n);
-                BN_free(e);
-
-                string jwks = R"({
-                    "keys": [
-                        {
-                            "alg": "RS256",
-                            "kty": "RSA",
-                            "use": "sig",
-                            "kid": "goodKID",
-                            "n": ")" + n_encoded + R"(",
-                            "e": ")" + e_encoded + R"("
-                        }
-                    ]
-                })";
-                res.set_content(jwks, "application/json");
-            });
-
-    // Catch-all handlers for other methods
-    auto methodNotAllowedHandler = [](const httplib::Request &req, httplib::Response &res)
-    {
-        if (req.path == "/auth" || req.path == "/.well-known/jwks.json")
-        {
-            res.status = 405;
-            res.set_content("Method Not Allowed", "text/plain");
+                sqlite3_stmt
